@@ -391,6 +391,7 @@ def _leer(cfg, fecha_pedida):
             r["productos"] = leer_productos(cur, fecha, [a["cheque"] for a in r["abiertas"]])
         except Exception as e:
             r["productos"] = []
+            r["error_productos"] = str(e)
             r["avisos"].append(f"Productos: {e}")
 
         # Bitácora
@@ -425,8 +426,10 @@ def _norm(v):
     return (s.lstrip("0") or "0") if s else ""
 
 
-def _productos_sql(cur, con_cat, con_grupo, where, params):
+def _productos_sql(cur, con_cat, con_grupo, where, params, con_epo=True):
     imp = "(IFNULL(m.cantidad,0) * IFNULL(m.precio,0))"
+    comp = ES_COMPONENTE if con_epo else "0"
+    paq = ES_PAQUETE if con_epo else "0"
     join, sel_desc, sel_grupo, grupo_by = "", "MAX(m.movimiento)", "''", "m.codigo"
     if con_cat:
         extra = ", MAX(`grupo`) AS grupo" if con_grupo else ""
@@ -441,9 +444,9 @@ def _productos_sql(cur, con_cat, con_grupo, where, params):
             grupo_by += ", p.grupo, gr.gnombre"
     cur.execute(f"""
         SELECT m.codigo AS codigo, {sel_desc} AS descripcion, {sel_grupo} AS grupo,
-               ROUND(SUM(CASE WHEN {ES_COMPONENTE} THEN 0 ELSE IFNULL(m.cantidad,0) END), 3) AS cant,
-               ROUND(SUM(CASE WHEN {ES_COMPONENTE} THEN IFNULL(m.cantidad,0) ELSE 0 END), 3) AS cant_pq,
-               MAX(CASE WHEN {ES_PAQUETE} THEN 1 ELSE 0 END) AS es_paquete,
+               ROUND(SUM(CASE WHEN {comp} THEN 0 ELSE IFNULL(m.cantidad,0) END), 3) AS cant,
+               ROUND(SUM(CASE WHEN {comp} THEN IFNULL(m.cantidad,0) ELSE 0 END), 3) AS cant_pq,
+               MAX(CASE WHEN {paq} THEN 1 ELSE 0 END) AS es_paquete,
                ROUND(SUM({imp} - IFNULL(m.desco,0)), 2) AS neto
         FROM POARMO01 m {join}
         WHERE ({where}) AND NOT ({CANC})
@@ -460,10 +463,11 @@ def leer_productos(cur, fecha, folios_mesa):
     folios = sorted({_norm(f) for f in folios_mesa if _norm(f)})
     mesa = (f"{LLAVE_M} IN ({', '.join(['%s'] * len(folios))})", folios) if folios else None
     error = None
-    for cat, gr in ((True, True), (True, False), (False, False)):
+    for cat, gr, epo in ((True, True, True), (True, False, True), (False, False, True),
+                         (True, True, False), (False, False, False)):
         try:
-            filas = _productos_sql(cur, cat, gr, *cobrado)
-            filas_m = _productos_sql(cur, cat, gr, *mesa) if mesa else []
+            filas = _productos_sql(cur, cat, gr, *cobrado, con_epo=epo)
+            filas_m = _productos_sql(cur, cat, gr, *mesa, con_epo=epo) if mesa else []
             break
         except pymysql.MySQLError as e:
             error = e
@@ -489,6 +493,72 @@ def leer_productos(cur, fecha, folios_mesa):
             salida.append(d)
     salida.sort(key=lambda d: -d["neto_p"])
     return salida
+
+
+def _a_hora(v):
+    """datetime, TIME de MySQL (timedelta) o texto 'HH:MM[:SS]' -> datetime (solo importa la hora)."""
+    if v is None or v == "":
+        return None
+    if isinstance(v, timedelta):
+        return datetime(2000, 1, 1) + v
+    dtm = a_datetime(v)
+    if dtm:
+        return dtm
+    m = re.match(r"^\s*(\d{1,2}):(\d{2})", str(v))
+    return datetime(2000, 1, 1, int(m.group(1)) % 24, int(m.group(2))) if m else None
+
+
+def leer_consumo(sucursal, mesa, cheque):
+    """Lo que lleva consumido una mesa abierta (POARMO01 de su cheque y mesa).
+    -> {"partidas": [...], "canceladas": n, "total": $}"""
+    token = _zona.set(zona_de(sucursal.get("zona")) if sucursal else ZONA)
+    conn = conectar(config_sucursal(sucursal) if sucursal else None)
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM POARMO01 m WHERE TRIM(m.mesa) = %s AND "
+                    f"{LLAVE_M} = %s ORDER BY m.id", (mesa, _norm(cheque)))
+        filas = cur.fetchall()
+        codigos = sorted({str(f.get("codigo") or "").strip() for f in filas if f.get("codigo")})
+        nombres = {}
+        if codigos:
+            try:
+                cur.execute(f"SELECT codigo, MAX(nombre) AS nombre FROM POARCO01 WHERE codigo IN "
+                            f"({', '.join(['%s'] * len(codigos))}) GROUP BY codigo", codigos)
+                nombres = {str(x["codigo"]).strip(): str(x["nombre"] or "").strip() for x in cur.fetchall()}
+            except Exception:
+                pass
+    finally:
+        conn.close()
+        _zona.reset(token)
+    partidas, canceladas = [], 0
+    for f in filas:
+        if str(f.get("status") or "").strip() == STATUS_CANCELADO_MO:
+            canceladas += 1
+            continue
+        codigo = str(f.get("codigo") or "").strip()
+        cantidad, precio, desco = a_float(f.get("cantidad")), a_float(f.get("precio")), a_float(f.get("desco"))
+        epo = str(f.get("epo") or "").strip()
+        hora = None
+        for k in ("hora", "hora_captura", "fecha_hora", "fechahora", "captura", "fecha"):
+            v = _a_hora(f.get(k))
+            if v and (v.hour or v.minute):
+                hora = v
+                break
+        obs = ""
+        for k in ("observaciones", "observacion", "obs", "comentario", "notas"):
+            if str(f.get(k) or "").strip():
+                obs = str(f.get(k)).strip()
+                break
+        partidas.append({
+            "codigo": codigo,
+            "descripcion": nombres.get(codigo) or str(f.get("movimiento") or codigo).strip(),
+            "cantidad": cantidad, "precio": precio, "descuento": desco,
+            "importe": round(cantidad * precio - desco, 2),
+            "componente": epo == "2", "paquete": epo == "1",
+            "mesero": codigo_mesero(f.get("mesero")), "hora": hora, "obs": obs,
+        })
+    return {"partidas": partidas, "canceladas": canceladas,
+            "total": round(sum(p["importe"] for p in partidas), 2)}
 
 
 def agrupar_productos(listas, por="descripcion"):
