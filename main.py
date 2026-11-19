@@ -33,6 +33,8 @@ CADA_SEGUNDOS = max(10, int(os.getenv("REFRESCO_SEG", "30") or 30))
 AZUL, VERDE, AMBAR, TEAL, ROJO, GRIS, MORADO = ("#1E3A8A", "#15803D", "#B7791F", "#0E7C7B",
                                                  "#B42323", "#5B6B82", "#6A1B9A")
 CONSOLIDADO = "__CONSOLIDADO__"
+TODOS = "__TODOS__"                      # opción "Todos los grupos" (Flet no acepta clave vacía)
+VERSION = "2026-11-19 c"
 
 
 def dinero(v):
@@ -47,7 +49,7 @@ def main(page: ft.Page):
     page.theme = ft.Theme(color_scheme_seed=AZUL)
 
     estado = {"vista": None, "fecha": None, "datos": None, "admin": False, "opciones": [],
-              "vivo": True, "hilo": False, "ultimo_ok": time.time()}
+              "vivo": True, "hilo": False, "ultimo_ok": time.time(), "suc_por_clave": {}}
     candado = threading.Lock()
 
     def aviso(texto, error=False):
@@ -97,6 +99,23 @@ def main(page: ft.Page):
     vista_resumen = ft.ListView(expand=True, spacing=10, padding=10)
     vista_mesas = ft.ListView(expand=True, spacing=6, padding=10)
     vista_sucursales = ft.ListView(expand=True, spacing=6, padding=10)
+    vista_agotados = ft.ListView(expand=True, spacing=6, padding=10)
+
+    def pintar_agotado(a, con_sucursal=False):
+        cab = ([ft.Container(ft.Text(a["sucursal"], size=11, color="white", weight=ft.FontWeight.BOLD),
+                             bgcolor=MORADO, border_radius=8, padding=ft.padding.symmetric(2, 7))]
+               if con_sucursal else [])
+        det = [x for x in (a["codigo"], a["grupo"],
+                           f"desde {a['desde']:%H:%M}" if a["desde"] else "", a["quien"]) if x]
+        return ft.Container(
+            bgcolor="white", border_radius=10, padding=10,
+            border=ft.border.only(left=ft.BorderSide(4, ROJO)),
+            content=ft.Row([
+                ft.Icon(ft.Icons.BLOCK, color=ROJO),
+                ft.Column([ft.Row(cab + [ft.Text(a["nombre"], size=15, weight=ft.FontWeight.BOLD)],
+                                  spacing=6, wrap=True),
+                           ft.Text("  ·  ".join(det), size=12, color=GRIS)], spacing=2, expand=True),
+            ], vertical_alignment=ft.CrossAxisAlignment.CENTER))
     lista_prod = ft.ListView(expand=True, spacing=4, padding=ft.padding.only(left=10, right=10, bottom=10))
     fila_prod_ind = ft.ResponsiveRow(spacing=8, run_spacing=8)
 
@@ -109,16 +128,16 @@ def main(page: ft.Page):
         actualizar()
 
     tx_prod = ft.TextField(hint_text="Buscar producto…", prefix_icon=ft.Icons.SEARCH, dense=True, bgcolor="white",
-                           border_radius=10, expand=True, on_change=filtro_prod_cambio)
-    dd_grupo = ft.Dropdown(value="", dense=True, bgcolor="white", border_radius=10, width=190,
-                           options=[ft.dropdown.Option("", "Todos los grupos")], on_change=filtro_prod_cambio)
-    dd_por = ft.Dropdown(value="descripcion", dense=True, bgcolor="white", border_radius=10, width=190,
+                           border_radius=10, col={"xs": 12, "md": 6}, on_change=filtro_prod_cambio)
+    dd_grupo = ft.Dropdown(value=TODOS, dense=True, bgcolor="white", border_radius=10, col={"xs": 6, "md": 3},
+                           options=[ft.dropdown.Option(TODOS, "Todos los grupos")], on_change=filtro_prod_cambio)
+    dd_por = ft.Dropdown(value="descripcion", dense=True, bgcolor="white", border_radius=10, col={"xs": 6, "md": 3},
                          visible=False, on_change=filtro_prod_cambio,
                          options=[ft.dropdown.Option("descripcion", "Por descripción"),
                                   ft.dropdown.Option("grupo", "Por grupo")])
     vista_productos = ft.Column([
         ft.Container(padding=ft.padding.only(left=10, right=10, top=10), content=ft.Column([
-            ft.Row([tx_prod, dd_grupo, dd_por], spacing=8, wrap=True),
+            ft.ResponsiveRow([tx_prod, dd_grupo, dd_por], spacing=8, run_spacing=8),
             fila_prod_ind,
             ft.Text("", size=11, color=GRIS),
         ], spacing=8)),
@@ -165,13 +184,13 @@ def main(page: ft.Page):
         por_grupo = por == "grupo"
         grupos = sorted({x["grupo"] for x in prods if x["grupo"]}, key=str.lower)
         dd_grupo.visible = not por_grupo
-        dd_grupo.options = [ft.dropdown.Option("", "Todos los grupos")] + [ft.dropdown.Option(g) for g in grupos]
+        dd_grupo.options = [ft.dropdown.Option(TODOS, "Todos los grupos")] + [ft.dropdown.Option(g) for g in grupos]
         if dd_grupo.value not in grupos:
-            dd_grupo.value = ""
+            dd_grupo.value = TODOS
         txt = (tx_prod.value or "").strip().lower()
         vis = [x for x in prods
                if (not txt or txt in x["descripcion"].lower() or txt in x["codigo"].lower())
-               and (por_grupo or not dd_grupo.value or x["grupo"] == dd_grupo.value)]
+               and (por_grupo or dd_grupo.value in (None, "", TODOS) or x["grupo"] == dd_grupo.value)]
         sv, sm, sp = (sum(x[k] for x in vis) for k in ("cant_v", "cant_m", "cant_p"))
         imp_v, imp_m, imp_p = (sum(x[k] for x in vis) for k in ("neto_v", "neto_m", "neto_p"))
         caja = lambda tit, val, col: ft.Container(
@@ -188,12 +207,15 @@ def main(page: ft.Page):
         nota.value = ("Códigos distintos por sucursal: se juntan por "
                       + ("grupo." if por_grupo else "descripción (las escritas igual)."
                          ) if cons else "Total = cobrado + lo que está en mesas abiertas.")
+        vacio = "Sin productos en el periodo." if not txt else "Sin coincidencias."
+        if not cons and d.get("error_productos"):
+            vacio = f"⚠ No pude leer los productos: {d['error_productos']}"
         lista_prod.controls = [renglon_producto(x, por_grupo, cons) for x in vis] or [
-            ft.Text("Sin productos en el periodo." if not txt else "Sin coincidencias.", color=GRIS)]
-    tabs = ft.Tabs(selected_index=0, expand=1, animation_duration=150)
+            ft.Text(vacio, color=ROJO if vacio.startswith("⚠") else GRIS)]
+    tabs = ft.Tabs(selected_index=0, expand=1, animation_duration=150, scrollable=True)
     lb_titulo = ft.Text(NEGOCIO, size=18, weight=ft.FontWeight.BOLD, color="white")
     lb_dia = ft.Text("", size=13, color="white", weight=ft.FontWeight.W_700)
-    lb_hora = ft.Text("", size=11, color="#C5CAE9")
+    lb_hora = ft.Text("", size=11, color="#C5CAE9", tooltip=f"versión {VERSION}")
     lb_avisos = ft.Text("", size=11, color=ROJO)
     barra = ft.ProgressBar(visible=False, color=AMBAR, bgcolor="#C5CAE9")
 
@@ -204,7 +226,8 @@ def main(page: ft.Page):
                              bgcolor=MORADO, border_radius=8, padding=ft.padding.symmetric(2, 7))]
                if con_sucursal else [])
         return ft.Container(
-            bgcolor="white", border_radius=10, padding=10,
+            bgcolor="white", border_radius=10, padding=10, ink=True,
+            on_click=lambda e, x=a: ver_consumo(x),
             content=ft.Row([
                 ft.Column([
                     ft.Row(cab + [ft.Text(f"Mesa {a['mesa']}", size=16, weight=ft.FontWeight.BOLD),
@@ -221,7 +244,70 @@ def main(page: ft.Page):
                            ft.Text("Impresa" if a["impresa"] else "Sin imprimir", size=11,
                                    color=VERDE if a["impresa"] else ROJO)],
                           horizontal_alignment=ft.CrossAxisAlignment.END, spacing=0),
+                ft.Icon(ft.Icons.CHEVRON_RIGHT, color=GRIS),
             ], vertical_alignment=ft.CrossAxisAlignment.CENTER))
+
+    # ── consumo de una mesa abierta (toca la mesa) ──
+    def ver_consumo(a):
+        vista = estado["vista"]
+        if vista == CONSOLIDADO:
+            vista = estado["suc_por_clave"].get(a.get("sucursal"))
+        cuerpo_dlg = ft.Column([ft.ProgressRing(width=28, height=28)], tight=True,
+                               horizontal_alignment=ft.CrossAxisAlignment.CENTER)
+        titulo = f"Mesa {a['mesa']} · cheque {a['cheque']}"
+        if a.get("sucursal"):
+            titulo = f"{a['sucursal']} · {titulo}"
+        dlg = ft.AlertDialog(
+            title=ft.Text(titulo, size=17, weight=ft.FontWeight.BOLD),
+            content=ft.Container(cuerpo_dlg, width=460),
+            actions=[ft.TextButton("Cerrar", on_click=lambda e: page.close(dlg))])
+        page.open(dlg)
+
+        def leer():
+            try:
+                c = dat.leer_consumo(vista, a["mesa"], a["cheque"])
+            except Exception as ex:
+                cuerpo_dlg.controls = [ft.Text(f"No pude leer el consumo: {ex}", color=ROJO)]
+                actualizar()
+                return
+            filas = []
+            for p in c["partidas"]:
+                det = []
+                if p["hora"]:
+                    det.append(f"{p['hora']:%H:%M}")
+                if p["mesero"]:
+                    det.append(f"mesero {p['mesero']}")
+                if p["descuento"]:
+                    det.append(f"desc. {dinero(p['descuento'])}")
+                if p["obs"]:
+                    det.append(p["obs"])
+                nombre = ("   ↳ " if p["componente"] else "📦 " if p["paquete"] else "") + p["descripcion"]
+                filas.append(ft.Container(
+                    padding=ft.padding.symmetric(6, 4),
+                    border=ft.border.only(bottom=ft.BorderSide(1, "#E5E9F0")),
+                    content=ft.Row([
+                        ft.Text(f"{p['cantidad']:g}", width=34, size=14, weight=ft.FontWeight.BOLD,
+                                text_align=ft.TextAlign.RIGHT),
+                        ft.Column([ft.Text(nombre, size=14, color=GRIS if p["componente"] else None),
+                                   ft.Text("  ·  ".join(det), size=11, color=GRIS)
+                                   if det else ft.Container(height=0)], spacing=0, expand=True),
+                        ft.Text("" if p["componente"] and not p["importe"] else dinero(p["importe"]),
+                                size=14, weight=ft.FontWeight.BOLD),
+                    ], vertical_alignment=ft.CrossAxisAlignment.START)))
+            pie = [ft.Row([ft.Text("TOTAL", size=15, weight=ft.FontWeight.W_900, expand=True),
+                           ft.Text(dinero(c["total"]), size=17, weight=ft.FontWeight.W_900, color=AMBAR)])]
+            if c["canceladas"]:
+                pie.append(ft.Text(f"{c['canceladas']} partida(s) cancelada(s) no se cuentan.", size=11,
+                                   color=ROJO))
+            cuerpo_dlg.controls = [
+                ft.Text(f"{a['mesero']}  ·  abierta {a['apertura']:%H:%M}" if a.get("apertura")
+                        else a["mesero"], size=12, color=GRIS),
+                ft.Container(ft.Column(filas or [ft.Text("Sin partidas todavía.", color=GRIS)],
+                                       spacing=0, scroll=ft.ScrollMode.AUTO), height=min(420, 60 + 52 * len(filas))),
+            ] + pie
+            cuerpo_dlg.horizontal_alignment = ft.CrossAxisAlignment.STRETCH
+            actualizar()
+        threading.Thread(target=leer, daemon=True).start()
 
     def pintar():
         d = estado["datos"]
@@ -284,9 +370,13 @@ def main(page: ft.Page):
 
         pintar_productos()
         n_prod = len(d["productos_por"]["descripcion"]) if es_cons else len(d.get("productos", []))
+        agotados = d.get("agotados", [])
+        vista_agotados.controls = [pintar_agotado(a, es_cons) for a in agotados] or [
+            ft.Text("No hay productos agotados. 👍", color=GRIS)]
         lista_tabs = [ft.Tab(text="📊 Resumen", content=vista_resumen),
                       ft.Tab(text=f"🌮 Productos ({n_prod})", content=vista_productos),
-                      ft.Tab(text=f"🪑 Mesas abiertas ({len(mesas)})", content=vista_mesas)]
+                      ft.Tab(text=f"🪑 Mesas abiertas ({len(mesas)})", content=vista_mesas),
+                      ft.Tab(text=f"🚫 Agotados ({len(agotados)})", content=vista_agotados)]
         if es_cons:
             vista_sucursales.controls = [tarjeta_sucursal(f) for f in d["filas"]] + [
                 tarjeta_sucursal({"sucursal": "TOTAL", "error": None, "fecha": d["fecha"], **t}, total=True)]
@@ -305,7 +395,7 @@ def main(page: ft.Page):
         else:
             lb_dia.value = f"Día de corte {d['fecha']:%d/%m/%Y}" + (
                 "" if d.get("es_corte") else f"  (en curso: {d['corte']:%d/%m/%Y})")
-        lb_hora.value = f"Actualizado {d['hora']:%H:%M:%S}"
+        lb_hora.value = f"Actualizado {d['hora']:%H:%M:%S}  ·  v{VERSION}"
         lb_avisos.value = ("⚠ " + " | ".join(d["avisos"])) if d["avisos"] else ""
         actualizar()
 
@@ -343,7 +433,9 @@ def main(page: ft.Page):
             actualizar()
             vista = estado["vista"]
             if vista == CONSOLIDADO:
-                estado["datos"] = dat.leer_consolidado(dat.sucursales(solo_activas=True), estado["fecha"])
+                lista = dat.sucursales(solo_activas=True)
+                estado["suc_por_clave"] = {x["clave"]: x for x in lista}
+                estado["datos"] = dat.leer_consolidado(lista, estado["fecha"])
             else:
                 estado["datos"] = dat.leer_resumen(vista, estado["fecha"])
             pintar()
@@ -380,7 +472,7 @@ def main(page: ft.Page):
                                 value=hoy, on_change=cambio, help_text="Día de corte",
                                 cancel_text="Cancelar", confirm_text="Aceptar"))
 
-    periodo = ft.Dropdown(value="corte", dense=True, bgcolor="white", border_radius=10, width=200,
+    periodo = ft.Dropdown(value="corte", dense=True, bgcolor="white", border_radius=10, width=250,
                           options=[ft.dropdown.Option("corte", "Día de corte en curso"),
                                    ft.dropdown.Option("ayer", "Ayer"),
                                    ft.dropdown.Option("fecha", "Otra fecha…")],
