@@ -394,6 +394,13 @@ def _leer(cfg, fecha_pedida):
             r["error_productos"] = str(e)
             r["avisos"].append(f"Productos: {e}")
 
+        # Agotados (lo que hoy no se puede vender: POARAG01)
+        try:
+            r["agotados"] = leer_agotados(cur)
+        except Exception as e:
+            r["agotados"] = []
+            r["avisos"].append(f"Agotados: {e}")
+
         # Bitácora
         try:
             cur.execute("SELECT LPAD(TRIM(concepto), 2, '0') AS c, COUNT(*) AS n, "
@@ -492,6 +499,49 @@ def leer_productos(cur, fecha, folios_mesa):
         if d["cant_p"] or d["neto_p"] or d["cant_pq"]:
             salida.append(d)
     salida.sort(key=lambda d: -d["neto_p"])
+    return salida
+
+
+def leer_agotados(cur):
+    """Productos agotados (POARAG01) con su nombre y grupo del catálogo."""
+    cur.execute("SHOW TABLES")
+    if not any(str(list(x.values())[0]).upper() == "POARAG01" for x in cur.fetchall()):
+        return []
+    cur.execute("SELECT * FROM POARAG01")
+    filas = cur.fetchall()
+    codigos = sorted({str(f.get("codigo") or "").strip() for f in filas if str(f.get("codigo") or "").strip()})
+    cat = {}
+    if codigos:
+        marcas = ", ".join(["%s"] * len(codigos))
+        try:
+            cur.execute(f"SELECT p.codigo, MAX(p.nombre) AS nombre, MAX(COALESCE(g.grupo, p.grupo)) AS grupo "
+                        f"FROM POARCO01 p LEFT JOIN POARGR01 g ON g.codigo = p.grupo "
+                        f"WHERE p.codigo IN ({marcas}) GROUP BY p.codigo", codigos)
+        except Exception:
+            cur.execute(f"SELECT codigo, MAX(nombre) AS nombre, '' AS grupo FROM POARCO01 "
+                        f"WHERE codigo IN ({marcas}) GROUP BY codigo", codigos)
+        cat = {str(x["codigo"]).strip(): (str(x["nombre"] or "").strip(), str(x["grupo"] or "").strip())
+               for x in cur.fetchall()}
+    salida, vistos = [], set()
+    for f in filas:
+        codigo = str(f.get("codigo") or "").strip()
+        if not codigo or codigo in vistos:
+            continue
+        vistos.add(codigo)
+        nombre, grupo = cat.get(codigo, ("", ""))
+        desde = None
+        for k in ("fecha_hora", "fechahora", "fecha", "hora", "creado", "alta"):
+            desde = _a_hora(f.get(k))
+            if desde:
+                break
+        quien = ""
+        for k in ("usuario", "cajero", "quien", "capturo"):
+            if str(f.get(k) or "").strip():
+                quien = str(f.get(k)).strip()
+                break
+        salida.append({"codigo": codigo, "nombre": nombre or str(f.get("nombre") or f.get("descripcion") or codigo),
+                       "grupo": grupo, "desde": desde, "quien": quien})
+    salida.sort(key=lambda x: (x["grupo"].lower(), x["nombre"].lower()))
     return salida
 
 
@@ -648,7 +698,7 @@ def leer_consolidado(lista, fecha=None):
 
     t = {k: 0 for k in SUMABLES}
     t["por_tipo"] = {tipo: [0, 0.0] for tipo in TIPOS}
-    filas, abiertas, avisos, fechas, prods = [], [], [], set(), []
+    filas, abiertas, avisos, fechas, prods, agot = [], [], [], set(), [], []
     for s, r, error in resultados:
         etiqueta = f"{s['clave']} {s['nombre']}"
         if error:
@@ -665,6 +715,7 @@ def leer_consolidado(lista, fecha=None):
         for a in r["abiertas"]:
             abiertas.append(dict(a, sucursal=s["clave"]))
         prods.append((s["clave"], r.get("productos", [])))
+        agot += [dict(a, sucursal=s["clave"]) for a in r.get("agotados", [])]
         avisos += [f"{s['clave']}: {a}" for a in r["avisos"]]
         fechas.add(r["fecha"])
         filas.append({"sucursal": etiqueta, "fecha": r["fecha"], "error": None,
@@ -673,6 +724,6 @@ def leer_consolidado(lista, fecha=None):
     abiertas.sort(key=lambda a: -a["importe"])
     return {"t": derivados(t), "filas": filas, "abiertas": abiertas, "avisos": avisos,
             "fecha": min(fechas) if len(fechas) == 1 else None, "fechas": sorted(fechas),
-            "hora": ahora(), "consolidado": True,
+            "hora": ahora(), "consolidado": True, "agotados": agot,
             "productos_por": {"descripcion": agrupar_productos(prods, "descripcion"),
                               "grupo": agrupar_productos(prods, "grupo")}}
